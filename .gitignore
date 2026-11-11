@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+out/
+.vs/
+.idea/
+CMakeUserPresets.json
+vcpkg_installed/
+supabase/.temp/
+*.log
+**/__pycache__/
