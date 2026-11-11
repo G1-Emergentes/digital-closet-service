@@ -22,8 +22,14 @@ add_executable(digital-closet-service
     "garment/infrastructure/SupabaseIdentityProvider.cpp"
     "garment/interfaces/GarmentController.cpp"
     "outfit/interfaces/OutfitController.cpp"
+    "shared/interfaces/ApiDocumentation.cpp"
 )
 target_link_libraries(digital-closet-service PRIVATE Drogon::Drogon)
+
+# Ninja presets place the executable here; reconfigure when documentation changes.
+foreach(asset index.html openapi.json swagger-ui.css swagger-ui-bundle.js swagger-initializer.js LICENSE VENDOR.md)
+    configure_file("docs/${asset}" "${CMAKE_CURRENT_BINARY_DIR}/docs/${asset}" COPYONLY)
+endforeach()
 
 include(CTest)
 if(BUILD_TESTING)
