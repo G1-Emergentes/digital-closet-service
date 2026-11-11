@@ -1,8 +1,11 @@
+#include "shared/interfaces/ApiDocumentation.h"
 #include <drogon/drogon.h>
 
-int main()
+int main(int argc, char *argv[])
 {
     drogon::app().setFileTypes({});
+    mirage::http::registerApiDocumentation(std::filesystem::absolute(argv[0]).parent_path() /
+                                           "docs");
     LOG_INFO << "Servidor Digital Closet iniciando en http://localhost:8081";
 
     drogon::app().registerHandler(
