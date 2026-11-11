@@ -12,6 +12,8 @@ class GarmentController : public drogon::HttpController<GarmentController>
     ADD_METHOD_TO(GarmentController::getGarment, "/api/v1/garments/{1}", drogon::Get);
     ADD_METHOD_TO(GarmentController::updateGarment, "/api/v1/garments/{1}", drogon::Put);
     ADD_METHOD_TO(GarmentController::deleteGarment, "/api/v1/garments/{1}", drogon::Delete);
+    ADD_METHOD_TO(GarmentController::imageUpload, "/api/v1/garments/{1}/image-upload",
+                  drogon::Post);
     ADD_METHOD_TO(GarmentController::setImage, "/api/v1/garments/{1}/image", drogon::Put);
     ADD_METHOD_TO(GarmentController::imageAccess, "/api/v1/garments/{1}/image-access",
                   drogon::Get);
@@ -23,6 +25,7 @@ class GarmentController : public drogon::HttpController<GarmentController>
     void getGarment(const drogon::HttpRequestPtr &, Callback &&, std::string id);
     void updateGarment(const drogon::HttpRequestPtr &, Callback &&, std::string id);
     void deleteGarment(const drogon::HttpRequestPtr &, Callback &&, std::string id);
+    void imageUpload(const drogon::HttpRequestPtr &, Callback &&, std::string id);
     void setImage(const drogon::HttpRequestPtr &, Callback &&, std::string id);
     void imageAccess(const drogon::HttpRequestPtr &, Callback &&, std::string id);
 };

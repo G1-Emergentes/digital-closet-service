@@ -60,11 +60,15 @@ class FakeRepository final : public GarmentRepository
         ++calls;
         done({200, Garment(id, jacket(), GarmentImage{imageId, 1}, 3, "2026-11-10T15:30:00Z"), ""});
     }
+    mutable bool missing = false;
     void findById(const GarmentAccess &, const std::string &id,
                   GarmentCompletion done) const override
     {
         ++calls;
-        done({200, Garment(id, jacket(), std::nullopt, 1, "2026-11-10T15:30:00Z"), ""});
+        if (missing)
+            done({404, std::nullopt, "GARMENT_NOT_FOUND"});
+        else
+            done({200, Garment(id, jacket(), std::nullopt, 1, "2026-11-10T15:30:00Z"), ""});
     }
     void list(const GarmentAccess &, int, const std::optional<std::string> &,
               PageCompletion done) const override
@@ -89,7 +93,13 @@ class FakeRepository final : public GarmentRepository
 class FakeSigner final : public ImageSigner
 {
   public:
-    mutable std::string signedPath;
+    mutable std::string signedPath, uploadPath;
+    void signUpload(const GarmentAccess &, const std::string &path,
+                    SignCompletion done) const override
+    {
+        uploadPath = path;
+        done({200, "https://storage.example.com/upload/x?token=t", ""});
+    }
     void sign(const GarmentAccess &, const std::string &path, int seconds,
               SignCompletion done) const override
     {
@@ -150,7 +160,8 @@ int main()
     GarmentCommandService commands(repository);
     GarmentQueryService queries(repository);
     GarmentImageService images(repository, signer);
-    GarmentAccess access{"Bearer token"};
+    const std::string kUser = "22222222-2222-2222-2222-222222222222";
+    GarmentAccess access{"Bearer token", kUser};
 
     // Invalid input never reaches the repository.
     rejects([&] { commands.handle(CreateGarmentCommand{access, "bad", jacket()}, {}); });
@@ -201,6 +212,19 @@ int main()
     images.handle(GarmentImageAccessQuery{access, kId}, [&](ImageAccess r) { result = r; });
     require(result.status == 404 && result.error == "IMAGE_NOT_FOUND" && signer.signedPath.empty());
     rejects([&] { images.handle(GarmentImageAccessQuery{access, "bad"}, {}); });
+
+    // Upload URL: the object path is {verified user}/{garment}/{image}, never client-chosen.
+    ImageUpload upload{};
+    images.handle(GarmentImageUploadQuery{access, kId, kImage}, [&](ImageUpload r) { upload = r; });
+    require(upload.status == 200 && upload.imageId == kImage && upload.url.rfind("https://", 0) == 0);
+    require(signer.uploadPath == kUser + "/" + kId + "/" + kImage);
+    // A garment that is not the caller's (or does not exist) never gets an upload URL.
+    signer.uploadPath.clear();
+    repository.missing = true;
+    images.handle(GarmentImageUploadQuery{access, kId, kImage}, [&](ImageUpload r) { upload = r; });
+    require(upload.status == 404 && upload.error == "GARMENT_NOT_FOUND" && signer.uploadPath.empty());
+    rejects([&] { images.handle(GarmentImageUploadQuery{access, "bad", kImage}, {}); });
+    rejects([&] { images.handle(GarmentImageUploadQuery{access, kId, "bad"}, {}); });
 
     std::cout << "garment tests passed\n";
 }

@@ -18,22 +18,24 @@ Failure failureOf(const ApiResult &result)
         return {503, "SERVICE_UNAVAILABLE"}; // migration not installed
     if (code == "P0002")
         return {404, "GARMENT_NOT_FOUND"};
-    if (code == "42501" || code == "PGRST301" || code == "PGRST303" || result.status == 401)
-        return {401, "UNAUTHENTICATED"};
     if (code == "23514" || code == "22P02" || code == "22007" || code == "MG001")
         return {400, "INVALID_ARGUMENT"};
-    if (result.status >= 500)
+    // The user was verified by IAM already, so a rejected service credential (401/403 or a
+    // JWT error) is our own misconfiguration, not an authentication failure of the caller.
+    if (result.status >= 500 || result.status == 401 || result.status == 403 || code == "42501")
         return {503, "SERVICE_UNAVAILABLE"};
     return {500, "INTERNAL_ERROR"};
 }
 using Handler = std::function<void(const Json::Value &)>;
 // Calls an RPC and routes failures to `fail`; `ok` only sees successful JSON bodies.
-void rpc(const char *name, const GarmentAccess &access, const Json::Value &parameters,
+void rpc(const char *name, const GarmentAccess &access, Json::Value parameters,
          std::function<void(int, const char *)> fail, Handler ok)
 {
+    // Every function takes the verified owner explicitly; the database never sees the bearer.
+    parameters["p_user_id"] = access.userId;
     SupabaseClient::request(
-        drogon::Post, std::string("/rest/v1/rpc/") + name, parameters, access.bearer,
-        [fail = std::move(fail), ok = std::move(ok)](ApiResult result) {
+        SupabaseTarget::Wardrobe, drogon::Post, std::string("/rest/v1/rpc/") + name, parameters,
+        "", [fail = std::move(fail), ok = std::move(ok)](ApiResult result) {
             if (result.status >= 400)
             {
                 const auto failure = failureOf(result);
@@ -50,7 +52,7 @@ void rpc(const char *name, const GarmentAccess &access, const Json::Value &param
             }
         });
 }
-void garmentRpc(const char *name, const GarmentAccess &access, const Json::Value &parameters,
+void garmentRpc(const char *name, const GarmentAccess &access, Json::Value parameters,
                 GarmentCompletion done)
 {
     auto shared = std::make_shared<GarmentCompletion>(std::move(done));

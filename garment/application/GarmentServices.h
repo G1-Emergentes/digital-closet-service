@@ -32,6 +32,12 @@ struct ImageAccess
     int version = 0;
 };
 using ImageAccessCompletion = std::function<void(ImageAccess)>;
+struct ImageUpload
+{
+    int status;
+    std::string imageId, url, error;
+};
+using ImageUploadCompletion = std::function<void(ImageUpload)>;
 // Contract section 7: the link lasts five minutes and is never persisted.
 class GarmentImageService
 {
@@ -45,5 +51,7 @@ class GarmentImageService
     {
     }
     void handle(const GarmentImageAccessQuery &, ImageAccessCompletion) const;
+    // Only for an existing garment of the caller; the object path is {user}/{garment}/{image}.
+    void handle(const GarmentImageUploadQuery &, ImageUploadCompletion) const;
 };
 } // namespace mirage::garment

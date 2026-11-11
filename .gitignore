@@ -9,3 +9,5 @@ vcpkg_installed/
 supabase/.temp/
 *.log
 **/__pycache__/
+.venv/
+.pytest_cache/

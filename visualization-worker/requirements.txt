@@ -1,0 +1,6 @@
+# Same pins as iam-service/avatar-worker.
+fastapi==0.162.2
+uvicorn==0.54.0
+httpx==0.28.1
+pillow==13.0.0
+pytest==9.2.0

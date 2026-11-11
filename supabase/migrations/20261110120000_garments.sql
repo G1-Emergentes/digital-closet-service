@@ -2,22 +2,31 @@
 -- wardrobes, garment_categories, garment_types, garments, garment_secondary_colors,
 -- store_garment_references. The contract's extra fields (styles, description, availability,
 -- revision, versioned image, soft delete) are extra columns on garments.
+--
+-- This database is separate from IAM's (database per service). Users are NOT in this
+-- database: the service validates the caller's token against IAM and passes the verified
+-- user id (p_user_id) to every function. Only the service's secret key (role service_role)
+-- can call them; anon and authenticated have no access at all.
 -- Additive: aborts on conflicting object names, never drops existing data.
--- Requires public.mirage_session_active and schema mirage_private (IAM, or session_helper).
 begin;
+
+create schema mirage_private;
+revoke all on schema mirage_private from public,anon,authenticated;
+grant usage on schema mirage_private to service_role;
 
 -- Used by CHECK constraints: true when an array has no repeated items.
 create function mirage_private.is_set(items text[]) returns boolean
 language sql immutable set search_path = '' as $$
     select cardinality(items) = (select count(distinct item) from unnest(items) item);
 $$;
-revoke all on function mirage_private.is_set(text[]) from public,anon;
-grant execute on function mirage_private.is_set(text[]) to authenticated;
+revoke all on function mirage_private.is_set(text[]) from public,anon,authenticated;
+grant execute on function mirage_private.is_set(text[]) to service_role;
 
--- One wardrobe per user, created with the first garment.
+-- One wardrobe per user, created with the first garment. user_id is a logical reference to
+-- IAM's user_accounts (another database), so it has no foreign key.
 create table public.wardrobes (
     id uuid primary key default gen_random_uuid(),
-    user_id uuid not null unique references auth.users(id),
+    user_id uuid not null unique,
     created_at timestamptz not null default now()
 );
 create table public.garment_categories (
@@ -91,73 +100,35 @@ $$;
 create trigger garment_revision before update on public.garments
     for each row execute function mirage_private.garment_revision();
 
+-- Deny by default: RLS on, no policies, no grants for anon/authenticated. The service
+-- reaches the data with its secret key (service_role), which bypasses RLS.
 alter table public.wardrobes enable row level security;
 alter table public.garment_categories enable row level security;
 alter table public.garment_types enable row level security;
 alter table public.garments enable row level security;
 alter table public.garment_secondary_colors enable row level security;
 alter table public.store_garment_references enable row level security;
-
-create policy wardrobe_owner on public.wardrobes for all to authenticated
-    using ((select auth.uid()) = user_id and (select public.mirage_session_active()))
-    with check ((select auth.uid()) = user_id and (select public.mirage_session_active()));
-create policy category_read on public.garment_categories for select to authenticated using (true);
-create policy type_read on public.garment_types for select to authenticated using (true);
--- shortcut: any signed-in user can add a type code; curate the list if it gets abused.
-create policy type_create on public.garment_types for insert to authenticated
-    with check (name ~ '^[A-Z0-9_]{1,60}$' and (select public.mirage_session_active()));
-create policy garment_owner on public.garments for all to authenticated
-    using (exists (select 1 from public.wardrobes w where w.id = wardrobe_id
-                   and w.user_id = (select auth.uid())) and (select public.mirage_session_active()))
-    with check (exists (select 1 from public.wardrobes w where w.id = wardrobe_id
-                        and w.user_id = (select auth.uid())) and (select public.mirage_session_active()));
-create policy secondary_color_owner on public.garment_secondary_colors for all to authenticated
-    using (exists (select 1 from public.garments g join public.wardrobes w on w.id = g.wardrobe_id
-                   where g.id = garment_id and w.user_id = (select auth.uid()))
-           and (select public.mirage_session_active()))
-    with check (exists (select 1 from public.garments g join public.wardrobes w on w.id = g.wardrobe_id
-                        where g.id = garment_id and w.user_id = (select auth.uid()))
-                and (select public.mirage_session_active()));
-create policy store_reference_owner on public.store_garment_references for all to authenticated
-    using (exists (select 1 from public.garments g join public.wardrobes w on w.id = g.wardrobe_id
-                   where g.id = garment_id and w.user_id = (select auth.uid()))
-           and (select public.mirage_session_active()))
-    with check (exists (select 1 from public.garments g join public.wardrobes w on w.id = g.wardrobe_id
-                        where g.id = garment_id and w.user_id = (select auth.uid()))
-                and (select public.mirage_session_active()));
 revoke all on public.wardrobes, public.garment_categories, public.garment_types, public.garments,
     public.garment_secondary_colors, public.store_garment_references from anon,authenticated;
-grant select,insert on public.wardrobes to authenticated;
-grant select on public.garment_categories to authenticated;
-grant select,insert on public.garment_types to authenticated;
-grant select,insert,update on public.garments to authenticated;
-grant select,insert,delete on public.garment_secondary_colors, public.store_garment_references to authenticated;
 
--- Private bucket. Clients upload to {user_id}/{garment_id}/{image_id}; only their own folder.
+-- Private bucket. The service signs uploads/downloads for {user_id}/{garment_id}/{image_id};
+-- clients never get direct Storage access.
 insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types)
 values ('garment-images','garment-images',false,8388608,array['image/jpeg','image/png','image/webp'])
 on conflict (id) do nothing;
-create policy garment_image_read on storage.objects for select to authenticated
-    using (bucket_id='garment-images' and (storage.foldername(name))[1]=(select auth.uid())::text and (select public.mirage_session_active()));
-create policy garment_image_insert on storage.objects for insert to authenticated
-    with check (bucket_id='garment-images' and (storage.foldername(name))[1]=(select auth.uid())::text and (select public.mirage_session_active()));
-create policy garment_image_update on storage.objects for update to authenticated
-    using (bucket_id='garment-images' and (storage.foldername(name))[1]=(select auth.uid())::text and (select public.mirage_session_active()))
-    with check (bucket_id='garment-images' and (storage.foldername(name))[1]=(select auth.uid())::text and (select public.mirage_session_active()));
-create policy garment_image_delete on storage.objects for delete to authenticated
-    using (bucket_id='garment-images' and (storage.foldername(name))[1]=(select auth.uid())::text and (select public.mirage_session_active()));
 
--- A rejected or revoked session fails loudly (42501) instead of looking like an empty closet.
-create function mirage_private.assert_session() returns void
+-- The verified user id is mandatory in every function.
+create function mirage_private.assert_user(p_user_id uuid) returns void
 language plpgsql set search_path = '' as $$
 begin
-    if auth.uid() is null or not public.mirage_session_active() then
-        raise insufficient_privilege;
-    end if;
+    if p_user_id is null then raise insufficient_privilege; end if;
 end;
 $$;
-revoke all on function mirage_private.assert_session() from public,anon;
-grant execute on function mirage_private.assert_session() to authenticated;
+
+create function mirage_private.wardrobe_of(p_user_id uuid) returns uuid
+language sql stable set search_path = '' as $$
+    select id from public.wardrobes where user_id = p_user_id;
+$$;
 
 -- Contract `colors`: the primary colour first, then the secondary ones sorted.
 create function mirage_private.garment_colors(g public.garments) returns text[]
@@ -167,8 +138,6 @@ language sql stable set search_path = '' as $$
             select c.color::text from public.garment_secondary_colors c
             where c.garment_id = g.id order by c.color), '{}'::text[]) end;
 $$;
-revoke all on function mirage_private.garment_colors(public.garments) from public,anon;
-grant execute on function mirage_private.garment_colors(public.garments) to authenticated;
 
 -- Same shape as the contract's colour list for a request: first = primary, rest sorted.
 create function mirage_private.canonical_colors(cols text[]) returns text[]
@@ -176,8 +145,6 @@ language sql immutable set search_path = '' as $$
     select case when cardinality(cols) = 0 then '{}'::text[]
         else array[cols[1]] || coalesce(array(select c from unnest(cols[2:]) c order by c), '{}'::text[]) end;
 $$;
-revoke all on function mirage_private.canonical_colors(text[]) from public,anon;
-grant execute on function mirage_private.canonical_colors(text[]) to authenticated;
 
 -- Finds the type for a category/subcategory pair, creating a new subcategory on demand.
 create function mirage_private.garment_type_id(p_category text, p_subcategory text) returns uuid
@@ -187,7 +154,6 @@ declare
     found_id uuid;
     found_category text;
 begin
-    -- Validate before inserting: a bad code is a 400 (check_violation), not an RLS denial.
     if type_name is null or type_name !~ '^[A-Z0-9_]{1,60}$' then raise check_violation; end if;
     insert into public.garment_types(category_id, name)
         select c.id, type_name from public.garment_categories c where c.name = p_category
@@ -200,8 +166,6 @@ begin
     return found_id;
 end;
 $$;
-revoke all on function mirage_private.garment_type_id(text,text) from public,anon;
-grant execute on function mirage_private.garment_type_id(text,text) to authenticated;
 
 -- GarmentReadModel of the contract (snake_case).
 create function public.mirage_garment_json(g public.garments) returns jsonb
@@ -219,18 +183,18 @@ language sql stable set search_path = '' as $$
     where t.id = g.garment_type_id;
 $$;
 
-create function public.mirage_create_garment(p_garment jsonb) returns jsonb
+create function public.mirage_create_garment(p_user_id uuid, p_garment jsonb) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 declare
     wardrobe uuid;
     cols text[];
     created public.garments;
 begin
-    perform mirage_private.assert_session();
+    perform mirage_private.assert_user(p_user_id);
     cols := array(select e from jsonb_array_elements_text(p_garment->'colors') with ordinality t(e, o) order by o);
     if cardinality(cols) <> (select count(distinct x) from unnest(cols) x) then raise check_violation; end if;
-    insert into public.wardrobes(user_id) values (auth.uid()) on conflict (user_id) do nothing;
-    select id into wardrobe from public.wardrobes where user_id = auth.uid();
+    insert into public.wardrobes(user_id) values (p_user_id) on conflict (user_id) do nothing;
+    wardrobe := mirage_private.wardrobe_of(p_user_id);
     insert into public.garments(id,wardrobe_id,garment_type_id,name,primary_color,styles,description,availability)
     values ((p_garment->>'id')::uuid, wardrobe,
         mirage_private.garment_type_id(p_garment->>'category', p_garment->>'subcategory'),
@@ -244,7 +208,7 @@ end;
 $$;
 
 -- Replaces every attribute. A request that changes nothing leaves revision untouched.
-create function public.mirage_update_garment(p_id uuid, p_garment jsonb) returns jsonb
+create function public.mirage_update_garment(p_user_id uuid, p_id uuid, p_garment jsonb) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 declare
     existing public.garments;
@@ -253,8 +217,9 @@ declare
     new_styles text[];
     new_type uuid;
 begin
-    perform mirage_private.assert_session();
-    select * into existing from public.garments where id = p_id and deleted_at is null for update;
+    perform mirage_private.assert_user(p_user_id);
+    select * into existing from public.garments
+        where id = p_id and deleted_at is null and wardrobe_id = mirage_private.wardrobe_of(p_user_id) for update;
     if not found then raise no_data_found; end if;
     cols := array(select e from jsonb_array_elements_text(p_garment->'colors') with ordinality t(e, o) order by o);
     if cardinality(cols) <> (select count(distinct x) from unnest(cols) x) then raise check_violation; end if;
@@ -276,34 +241,36 @@ begin
 end;
 $$;
 
-create function public.mirage_delete_garment(p_id uuid) returns jsonb
+create function public.mirage_delete_garment(p_user_id uuid, p_id uuid) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 begin
-    perform mirage_private.assert_session();
-    update public.garments set deleted_at = now() where id = p_id and deleted_at is null;
+    perform mirage_private.assert_user(p_user_id);
+    update public.garments set deleted_at = now()
+        where id = p_id and deleted_at is null and wardrobe_id = mirage_private.wardrobe_of(p_user_id);
     if not found then raise no_data_found; end if;
     return jsonb_build_object('id', p_id);
 end;
 $$;
 
-create function public.mirage_get_garment(p_id uuid) returns jsonb
+create function public.mirage_get_garment(p_user_id uuid, p_id uuid) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 begin
-    perform mirage_private.assert_session();
+    perform mirage_private.assert_user(p_user_id);
     return (select public.mirage_garment_json(g) from public.garments g
-            where g.id = p_id and g.deleted_at is null);
+            where g.id = p_id and g.deleted_at is null and g.wardrobe_id = mirage_private.wardrobe_of(p_user_id));
 end;
 $$;
 
 -- Stable order by id; the cursor is the last id of the previous page.
-create function public.mirage_list_garments(p_limit integer, p_cursor uuid) returns jsonb
+create function public.mirage_list_garments(p_user_id uuid, p_limit integer, p_cursor uuid) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 declare ids uuid[];
 begin
-    perform mirage_private.assert_session();
+    perform mirage_private.assert_user(p_user_id);
     if p_limit is null or p_limit not between 1 and 100 then raise check_violation; end if;
     ids := array(select g.id from public.garments g
-                 where g.deleted_at is null and (p_cursor is null or g.id > p_cursor)
+                 where g.wardrobe_id = mirage_private.wardrobe_of(p_user_id) and g.deleted_at is null
+                   and (p_cursor is null or g.id > p_cursor)
                  order by g.id limit p_limit + 1);
     return jsonb_build_object(
         'items', coalesce((select jsonb_agg(public.mirage_garment_json(g) order by g.id)
@@ -313,10 +280,10 @@ end;
 $$;
 
 -- One result per requested id, in request order. Other owners' garments are NOT_FOUND.
-create function public.mirage_resolve_garments(p_ids uuid[]) returns jsonb
+create function public.mirage_resolve_garments(p_user_id uuid, p_ids uuid[]) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 begin
-    perform mirage_private.assert_session();
+    perform mirage_private.assert_user(p_user_id);
     if p_ids is null or cardinality(p_ids) not between 1 and 100
        or (select count(distinct i) from unnest(p_ids) i) <> cardinality(p_ids) then
         raise check_violation;
@@ -329,21 +296,23 @@ begin
             'garment', case when g.availability = 'AVAILABLE' then public.mirage_garment_json(g) end)
             order by r.ord)
         from unnest(p_ids) with ordinality r(id, ord)
-        left join public.garments g on g.id = r.id and g.deleted_at is null));
+        left join public.garments g on g.id = r.id and g.deleted_at is null
+                                    and g.wardrobe_id = mirage_private.wardrobe_of(p_user_id)));
 end;
 $$;
 
 -- Registers an image the client already uploaded. A new id starts at version 1; the same
 -- id again means its content was replaced, so the version grows.
-create function public.mirage_set_garment_image(p_id uuid, p_image_id uuid) returns jsonb
+create function public.mirage_set_garment_image(p_user_id uuid, p_id uuid, p_image_id uuid) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 declare
     existing public.garments;
     changed public.garments;
-    object_path text := auth.uid()::text || '/' || p_id::text || '/' || p_image_id::text;
+    object_path text := p_user_id::text || '/' || p_id::text || '/' || p_image_id::text;
 begin
-    perform mirage_private.assert_session();
-    select * into existing from public.garments where id = p_id and deleted_at is null for update;
+    perform mirage_private.assert_user(p_user_id);
+    select * into existing from public.garments
+        where id = p_id and deleted_at is null and wardrobe_id = mirage_private.wardrobe_of(p_user_id) for update;
     if not found then raise no_data_found; end if;
     if not exists (select 1 from storage.objects o where o.bucket_id = 'garment-images' and o.name = object_path) then
         raise exception 'image_not_uploaded' using errcode = 'MG001';
@@ -357,12 +326,13 @@ end;
 $$;
 
 -- Where the photo lives in the bucket; the service signs it for five minutes.
-create function public.mirage_garment_image(p_id uuid) returns jsonb
+create function public.mirage_garment_image(p_user_id uuid, p_id uuid) returns jsonb
 language plpgsql security invoker set search_path = '' as $$
 declare g public.garments;
 begin
-    perform mirage_private.assert_session();
-    select * into g from public.garments where id = p_id and deleted_at is null;
+    perform mirage_private.assert_user(p_user_id);
+    select * into g from public.garments
+        where id = p_id and deleted_at is null and wardrobe_id = mirage_private.wardrobe_of(p_user_id);
     if not found then raise no_data_found; end if;
     if g.image_id is null then
         return jsonb_build_object('image_id', null);
@@ -374,16 +344,20 @@ begin
 end;
 $$;
 
-revoke all on function public.mirage_garment_json(public.garments),
-    public.mirage_create_garment(jsonb), public.mirage_update_garment(uuid,jsonb),
-    public.mirage_delete_garment(uuid), public.mirage_get_garment(uuid),
-    public.mirage_list_garments(integer,uuid), public.mirage_resolve_garments(uuid[]),
-    public.mirage_set_garment_image(uuid,uuid), public.mirage_garment_image(uuid)
-    from public,anon;
-grant execute on function public.mirage_garment_json(public.garments),
-    public.mirage_create_garment(jsonb), public.mirage_update_garment(uuid,jsonb),
-    public.mirage_delete_garment(uuid), public.mirage_get_garment(uuid),
-    public.mirage_list_garments(integer,uuid), public.mirage_resolve_garments(uuid[]),
-    public.mirage_set_garment_image(uuid,uuid), public.mirage_garment_image(uuid)
-    to authenticated;
+revoke all on function mirage_private.assert_user(uuid), mirage_private.wardrobe_of(uuid),
+    mirage_private.garment_colors(public.garments), mirage_private.canonical_colors(text[]),
+    mirage_private.garment_type_id(text,text), public.mirage_garment_json(public.garments),
+    public.mirage_create_garment(uuid,jsonb), public.mirage_update_garment(uuid,uuid,jsonb),
+    public.mirage_delete_garment(uuid,uuid), public.mirage_get_garment(uuid,uuid),
+    public.mirage_list_garments(uuid,integer,uuid), public.mirage_resolve_garments(uuid,uuid[]),
+    public.mirage_set_garment_image(uuid,uuid,uuid), public.mirage_garment_image(uuid,uuid)
+    from public,anon,authenticated;
+grant execute on function mirage_private.assert_user(uuid), mirage_private.wardrobe_of(uuid),
+    mirage_private.garment_colors(public.garments), mirage_private.canonical_colors(text[]),
+    mirage_private.garment_type_id(text,text), public.mirage_garment_json(public.garments),
+    public.mirage_create_garment(uuid,jsonb), public.mirage_update_garment(uuid,uuid,jsonb),
+    public.mirage_delete_garment(uuid,uuid), public.mirage_get_garment(uuid,uuid),
+    public.mirage_list_garments(uuid,integer,uuid), public.mirage_resolve_garments(uuid,uuid[]),
+    public.mirage_set_garment_image(uuid,uuid,uuid), public.mirage_garment_image(uuid,uuid)
+    to service_role;
 commit;

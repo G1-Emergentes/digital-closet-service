@@ -22,26 +22,44 @@ std::string environment(const char *name)
     return value ? value : "";
 #endif
 }
-
-} // namespace
-std::string SupabaseClient::baseUrl()
+struct Config
 {
-    return environment("SUPABASE_URL");
+    std::string url, key;
+    bool forwardBearer;
+};
+// A copied URL often ends with "/"; accept it instead of failing with "not configured".
+std::string withoutTrailingSlash(std::string url)
+{
+    while (!url.empty() && url.back() == '/')
+        url.pop_back();
+    return url;
 }
-void SupabaseClient::request(HttpMethod method, const std::string &path, const Json::Value &body,
-                             const std::string &bearer, Completion done)
+Config configFor(SupabaseTarget target)
 {
-    const auto url = environment("SUPABASE_URL");
-    const auto key = environment("SUPABASE_PUBLISHABLE_KEY");
+    if (target == SupabaseTarget::Wardrobe)
+        return {withoutTrailingSlash(environment("SUPABASE_URL")), environment("SUPABASE_SECRET_KEY"),
+                false};
+    return {withoutTrailingSlash(environment("IAM_SUPABASE_URL")),
+            environment("IAM_SUPABASE_PUBLISHABLE_KEY"), true};
+}
+} // namespace
+std::string SupabaseClient::baseUrl(SupabaseTarget target)
+{
+    return configFor(target).url;
+}
+void SupabaseClient::request(SupabaseTarget target, HttpMethod method, const std::string &path,
+                             const Json::Value &body, const std::string &bearer, Completion done)
+{
+    const auto config = configFor(target);
     static const std::regex origin(
         R"(^https://[A-Za-z0-9.-]+(:[0-9]+)?$|^http://(127\.0\.0\.1|localhost):[0-9]+$)");
-    if (url.empty() || key.empty() || !std::regex_match(url, origin) ||
-        key.find_first_of("\r\n") != std::string::npos)
+    if (config.url.empty() || config.key.empty() || !std::regex_match(config.url, origin) ||
+        config.key.find_first_of("\r\n") != std::string::npos)
     {
         done(failure(503, "auth_not_configured"));
         return;
     }
-    auto client = HttpClient::newHttpClient(url);
+    auto client = HttpClient::newHttpClient(config.url);
     auto req = HttpRequest::newHttpJsonRequest(body);
     req->setMethod(method);
     const auto query = path.find('?');
@@ -51,8 +69,9 @@ void SupabaseClient::request(HttpMethod method, const std::string &path, const J
         const auto equals = path.find('=', query);
         req->setQueryParameter(path.substr(query + 1, equals - query - 1), path.substr(equals + 1));
     }
-    req->addHeader("apikey", key);
-    if (!bearer.empty())
+    // The secret key goes only in `apikey`: the gateway derives the privileged role from it.
+    req->addHeader("apikey", config.key);
+    if (config.forwardBearer && !bearer.empty())
         req->addHeader("Authorization", bearer);
     client->sendRequest(
         req,

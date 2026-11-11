@@ -112,4 +112,28 @@ void GarmentImageService::handle(const GarmentImageAccessQuery &query,
                          });
         });
 }
+void GarmentImageService::handle(const GarmentImageUploadQuery &query,
+                                 ImageUploadCompletion done) const
+{
+    requireUuid(query.id, "id");
+    requireUuid(query.imageId, "image_id");
+    repository_.findById(
+        query.access, query.id,
+        [this, query, done = std::move(done)](GarmentResult found) {
+            if (!found.garment)
+            {
+                done({found.status, "", "", found.error});
+                return;
+            }
+            const auto path = query.access.userId + "/" + query.id + "/" + query.imageId;
+            signer_.signUpload(query.access, path, [imageId = query.imageId, done](SignResult s) {
+                if (s.status != 200)
+                {
+                    done({s.status, "", "", s.error});
+                    return;
+                }
+                done({200, imageId, s.url, ""});
+            });
+        });
+}
 } // namespace mirage::garment

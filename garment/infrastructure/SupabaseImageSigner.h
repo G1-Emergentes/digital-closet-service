@@ -2,12 +2,13 @@
 #include "../application/ImageSigner.h"
 namespace mirage::garment
 {
-// Signs private objects in the `garment-images` bucket with the caller's own JWT, so
-// Storage policies decide access and no service key is needed.
+// Signs objects in the private `garment-images` bucket with the service's secret key.
 class SupabaseImageSigner final : public ImageSigner
 {
   public:
     void sign(const GarmentAccess &, const std::string &path, int seconds,
               SignCompletion) const override;
+    void signUpload(const GarmentAccess &, const std::string &path,
+                    SignCompletion) const override;
 };
 } // namespace mirage::garment

@@ -10,10 +10,12 @@ Estado: propuesta para revisar antes de implementar. Sigue las convenciones de
 | --- | --- | --- |
 | Ubicación | Proyecto propio `digital-closet-service/`, hermano de `iam-service/`, puerto 8081 | IAM ya tiene su propio repositorio y ciclo; el contrato permite un bounded context separado. |
 | Stack | C++17 + Drogon + Supabase (PostgreSQL, Storage), igual que IAM | Pedido explícito: seguir cómo está hecho IAM. |
-| Identidad | El JWT del usuario viaja a PostgREST; el propietario sale de `auth.uid()` en SQL | Es el patrón de IAM (RPC `SECURITY INVOKER` + RLS). No hay `service_role` ni `user_id` del cliente. |
-| Sesión revocada | Las políticas RLS reutilizan `public.mirage_session_active()` | Logout inmediato, igual que `user_profiles`. |
+| Base de datos | Una base propia (Wardrobe Database), **separada de la de IAM** | El diagrama del proyecto define una base por servicio. `wardrobes.user_id` es un UUID sin FK: referencia lógica a IAM. |
+| Identidad | El servicio valida el token contra **IAM** (`GET /auth/v1/user` y `mirage_session_active`, igual que `ProfileController`) y obtiene el `userId` | Los usuarios no existen en esta base; un token de IAM no vale en ella. El `userId` nunca viene del cliente. |
+| Acceso a datos | Clave secreta de esta base (`SUPABASE_SECRET_KEY`), solo en el servidor; cada función SQL recibe `p_user_id` | Con bases separadas no se puede usar `auth.uid()`. Las tablas niegan todo a `anon`/`authenticated`; solo `service_role` ejecuta las funciones. |
+| Sesión revocada | Se comprueba en IAM en cada petición | Logout inmediato, igual que IAM. |
 | Código compartido | Se copian `shared/` (`ApiResult`, `SupabaseClient`, `HttpSupport`) | shortcut: duplicación de 3 archivos pequeños; extraer a una librería común si aparece un tercer servicio. |
-| Imágenes | Bucket privado `garment-images`; Flutter sube directo a Storage con su JWT; el servicio solo registra la referencia y firma URLs | El servicio no proxea bytes y no necesita claves privilegiadas. |
+| Imágenes | Bucket privado `garment-images`; el servicio entrega una URL de subida firmada (`POST /garments/{id}/image-upload`) y luego registra la imagen; las descargas usan URLs firmadas de 5 min | El cliente no tiene credenciales de esta base, así que no puede subir directo a Storage. |
 
 ## 2. Organización (misma forma que `profile/`)
 
@@ -76,16 +78,18 @@ proyecto. Migración aditiva en una transacción, como IAM.
   `availability`, `image_id`, `image_version`, `revision` y `deleted_at` (borrado lógico).
 - `revision` la incrementa un trigger en cada `UPDATE` de `garments`; las RPC omiten la
   escritura si nada cambió. Un cambio solo en colores secundarios también la incrementa.
-- RLS en todas las tablas por propietario del armario y sesión activa. Las categorías y
-  los tipos son de lectura para cualquier usuario autenticado.
-- RPC `SECURITY INVOKER`, `search_path` vacío: `mirage_create_garment`,
+- RLS activo en todas las tablas, sin políticas y sin permisos para `anon`/`authenticated`:
+  se niega todo por defecto. El servicio entra con su clave secreta (`service_role`), que
+  salta RLS, y por eso **cada función filtra por `p_user_id`** (el armario del usuario).
+- RPC `SECURITY INVOKER`, `search_path` vacío, ejecutables solo por `service_role`; todas
+  reciben `p_user_id` como primer argumento: `mirage_create_garment`,
   `mirage_update_garment`, `mirage_delete_garment`, `mirage_get_garment`,
   `mirage_list_garments`, `mirage_resolve_garments`, `mirage_set_garment_image`,
   `mirage_garment_image`.
-- shortcut: cualquier usuario autenticado puede crear un código de subcategoría nuevo (la
-  tabla de tipos es global, como en el diagrama); curar la lista si se abusa.
-- Storage: bucket privado `garment-images` y políticas en `storage.objects` solo para la
-  carpeta `{auth.uid()}/...`. Ruta del objeto: `{user_id}/{garment_id}/{image_id}`.
+- shortcut: cualquier usuario autenticado en IAM puede crear un código de subcategoría nuevo
+  (la tabla de tipos es global, como en el diagrama); curar la lista si se abusa.
+- Storage: bucket privado `garment-images`, sin políticas para clientes; el servicio firma
+  las subidas y descargas. Ruta del objeto: `{user_id}/{garment_id}/{image_id}`.
 - Fase 2: `outfits`, `outfit_items`, `outfit_visualizations` y bucket
   `outfit-visualizations`, con las mismas políticas.
 
@@ -103,7 +107,8 @@ Recommendation y no cambian de forma (JSON `snake_case` según el contrato).
 | `GET /garments/{id}` | Leer una prenda |
 | `PUT /garments/{id}` | Reemplazar atributos y disponibilidad (como `PUT` de Profile) |
 | `DELETE /garments/{id}` | Borrado lógico (204) |
-| `PUT /garments/{id}/image` | Registrar imagen ya subida a Storage: sube `image.version` |
+| `POST /garments/{id}/image-upload` | Devuelve `image_id` y una URL firmada (`PUT`) para subir la foto |
+| `PUT /garments/{id}/image` | Registrar la imagen ya subida: sube `image.version` |
 | `GET /health`, `/docs`, `/openapi.json` | Igual que IAM |
 
 Fase 2: `POST/GET /outfits`, `GET/DELETE /outfits/{id}`,
@@ -128,9 +133,10 @@ Fase 2: `POST/GET /outfits`, `GET/DELETE /outfits/{id}`,
 
 | Pieza | Estado |
 | --- | --- |
-| Dominio `Garment`, comandos/consultas, servicio de imagen | Hecho; compila y pasa `garment-domain-tests` |
-| Migración `20261110120000_garments.sql` (esquema del diagrama) | Aplicada y probada en el proyecto de desarrollo `mirage-digital-closet`; avisos de seguridad vacíos |
-| Repositorio Supabase, mapeador, firmador de imágenes, controlador | Compilan; 8 rutas probadas por HTTP contra Supabase real |
+| Dominio `Garment`, comandos/consultas, servicio de imagen | Hecho; compila y pasa `garment-domain-tests` (incluye la subida firmada) |
+| Migración `20261110120000_garments.sql` (base separada, acceso por `service_role`) | Escrita; **sin aplicar ni probar**. El proyecto de desarrollo actual tiene la versión anterior (con `auth.uid()`) y hay que recrearlo |
+| Validación de identidad contra IAM, repositorio, firmador, controlador | Compilan; **sin probar contra Supabase** hasta tener la clave secreta y una cuenta de IAM |
+| Worker de visualización (`visualization-worker/`) | Escrito y con 9 pruebas que pasan (con dobles). **Sin probar con Cloudflare real**: falta `CF_API_TOKEN` y que la cuenta tenga foto de avatar en IAM |
 | Rate limit (`429` + `Retry-After`) | No implementado |
 | Swagger / OpenAPI | Pendiente |
 | Outfits guardados y visualización (fase 2) | Pendiente |

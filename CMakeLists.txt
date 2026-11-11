@@ -19,6 +19,7 @@ add_executable(digital-closet-service
     "garment/infrastructure/GarmentJsonMapper.cpp"
     "garment/infrastructure/SupabaseGarmentRepository.cpp"
     "garment/infrastructure/SupabaseImageSigner.cpp"
+    "garment/infrastructure/SupabaseIdentityProvider.cpp"
     "garment/interfaces/GarmentController.cpp"
 )
 target_link_libraries(digital-closet-service PRIVATE Drogon::Drogon)

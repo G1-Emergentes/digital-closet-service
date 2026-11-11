@@ -3,10 +3,11 @@
 #include <functional>
 namespace mirage::garment
 {
-// Credentials stay in the request context; the owner is derived from them by the database.
+// `userId` is the owner, verified against IAM before any use. It is never taken from the
+// request body. The bearer stays in the request context and is not persisted.
 struct GarmentAccess
 {
-    std::string bearer;
+    std::string bearer, userId;
 };
 // `error` carries a contract error code (e.g. GARMENT_NOT_FOUND) when status != 2xx.
 struct GarmentResult
