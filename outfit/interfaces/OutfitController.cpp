@@ -25,7 +25,10 @@ void failDatabase(const Callback &callback, const ApiResult &result, const char 
     const auto code = result.body.get("code", "").asString();
     if (code == "P0002")
         fail(callback, 404, notFound);
-    else if (code == "23514" || code == "22P02" || code == "22007" || code == "MG001")
+    else if (code == "MG003")
+        fail(callback, 404, "GARMENT_NOT_FOUND");
+    else if (code == "23514" || code == "22P02" || code == "22007" || code == "22001" ||
+             code == "MG001")
         fail(callback, 400, "INVALID_ARGUMENT");
     // The caller was verified by IAM, so a rejected service credential is our misconfiguration.
     else if (code == "PGRST202" || code == "42P01" || code == "42501" || result.status >= 500 ||
@@ -69,6 +72,24 @@ Json::Value optionalText(const Json::Value &body, const char *key)
         throw std::invalid_argument(std::string(key) + " debe ser texto.");
     return value;
 }
+// Whitelisted request fields only (the owner is never read from the body).
+Json::Value outfitPayload(const Json::Value &body)
+{
+    Json::Value outfit;
+    const auto &ids = body["garment_ids"];
+    if (!ids.isArray())
+        throw std::invalid_argument("garment_ids debe contener entre 1 y 3 UUID únicos.");
+    outfit["garment_ids"] = Json::Value(Json::arrayValue);
+    for (const auto &id : ids)
+    {
+        if (!id.isString())
+            throw std::invalid_argument("garment_ids debe contener entre 1 y 3 UUID únicos.");
+        outfit["garment_ids"].append(id);
+    }
+    for (const char *key : {"name", "occasion", "style", "recommendation_id"})
+        outfit[key] = optionalText(body, key);
+    return outfit;
+}
 std::string utcAfter(int seconds)
 {
     const std::time_t at = std::time(nullptr) + seconds;
@@ -91,20 +112,8 @@ void OutfitController::createOutfit(const HttpRequestPtr &req, Callback &&callba
     Json::Value outfit;
     try
     {
-        const auto &ids = body["garment_ids"];
-        if (!ids.isArray())
-            throw std::invalid_argument("garment_ids debe contener entre 1 y 3 UUID únicos.");
-        outfit["garment_ids"] = Json::Value(Json::arrayValue);
-        for (const auto &id : ids)
-        {
-            if (!id.isString())
-                throw std::invalid_argument("garment_ids debe contener entre 1 y 3 UUID únicos.");
-            outfit["garment_ids"].append(id);
-        }
-        // Whitelisted fields only; the id is ours.
-        outfit["id"] = drogon::utils::getUuid();
-        for (const char *key : {"name", "occasion", "style", "recommendation_id"})
-            outfit[key] = optionalText(body, key);
+        outfit = outfitPayload(body);
+        outfit["id"] = drogon::utils::getUuid(); // the id is ours
     }
     catch (const std::invalid_argument &e)
     {
@@ -149,6 +158,28 @@ void OutfitController::getOutfit(const HttpRequestPtr &req, Callback &&callback,
                  fail(callback, 404, "OUTFIT_NOT_FOUND");
              else
                  http::reply(callback, k200OK, outfit);
+         });
+}
+void OutfitController::updateOutfit(const HttpRequestPtr &req, Callback &&callback,
+                                    std::string id)
+{
+    Json::Value body;
+    if (!http::json(req, body, callback))
+        return;
+    Json::Value p;
+    try
+    {
+        p["p_outfit"] = outfitPayload(body);
+    }
+    catch (const std::invalid_argument &e)
+    {
+        http::error(callback, k400BadRequest, "INVALID_ARGUMENT", e.what());
+        return;
+    }
+    p["p_id"] = id;
+    call(req, callback, "mirage_update_outfit", p, "OUTFIT_NOT_FOUND",
+         [callback](const Json::Value &outfit, const std::string &) {
+             http::reply(callback, k200OK, outfit);
          });
 }
 void OutfitController::deleteOutfit(const HttpRequestPtr &req, Callback &&callback,
