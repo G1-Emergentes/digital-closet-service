@@ -138,8 +138,9 @@ Fase 2: `POST/GET /outfits`, `GET/DELETE /outfits/{id}`,
 | Validación de identidad contra IAM, repositorio, firmador, controlador | Compilan; **sin probar contra Supabase** hasta tener la clave secreta y una cuenta de IAM |
 | Worker de visualización (`visualization-worker/`) | Escrito y con 9 pruebas que pasan (con dobles). **Sin probar con Cloudflare real**: falta `CF_API_TOKEN` y que la cuenta tenga foto de avatar en IAM |
 | Rate limit (`429` + `Retry-After`) | No implementado |
-| Swagger / OpenAPI | Pendiente |
-| Outfits guardados y visualización (fase 2) | Pendiente |
+| Swagger / OpenAPI | Hecho: `/docs` y `/openapi.json` (18 operaciones); `tests/openapi_contract.py` comprueba que coinciden con las rutas |
+| Outfits guardados (`/outfits`: crear, listar, leer, editar, borrar, imagen del look) | Hecho; migraciones `20261111000000_outfits.sql`, `20261111120000_outfit_images.sql` y `20261111180000_outfit_update.sql` aplicadas. Extienden el contrato: avisar a quien hace Recommendation |
+| Visualización con estado en el servidor (`outfit_visualizations`) | Pendiente (hoy el worker genera la imagen y la app la guarda en el outfit) |
 
 ## 7. Escaneo de prendas y generación de imágenes
 
