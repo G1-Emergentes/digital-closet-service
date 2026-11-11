@@ -1,3 +1,4 @@
+import base64
 import io
 import time
 
@@ -56,14 +57,115 @@ def test_prompt_uses_only_closed_fields_never_free_text():
     assert attack not in prompt
 
 
+def b64(data):
+    return base64.b64encode(data).decode()
+
+
 def test_request_validation():
-    assert worker.parse_request({"garment_ids": [G1, G2], "recommendation_id": G1}) == ([G1, G2], G1)
-    assert worker.parse_request({"garment_ids": [G1]}) == ([G1], None)
+    assert worker.parse_request({"garment_ids": [G1, G2], "recommendation_id": G1}) == ([G1, G2], G1, None)
+    assert worker.parse_request({"garment_ids": [G1]}) == ([G1], None, None)
     for bad in ({}, {"garment_ids": []}, {"garment_ids": [G1, G2, G1, G2]}, {"garment_ids": [G1, G1]},
                 {"garment_ids": ["nope"]}, {"garment_ids": [G1], "recommendation_id": "nope"}, []):
         with pytest.raises(worker.Problem) as error:
             worker.parse_request(bad)
         assert error.value.status == 400 and error.value.code == "INVALID_ARGUMENT"
+
+
+def test_uploaded_person_photo_is_validated_at_the_trust_boundary():
+    photo = jpeg()
+    ids, _, data = worker.parse_request({"garment_ids": [G1], "person_photo": b64(photo)})
+    assert data == photo
+    # A data URL prefix is accepted too.
+    assert worker.parse_request({"garment_ids": [G1], "person_photo": "data:image/jpeg;base64," + b64(photo)})[2] == photo
+    gif = io.BytesIO()
+    Image.new("RGB", (400, 400)).save(gif, format="GIF")
+    for bad in ("not base64!!", b64(b"definitely not an image"), b64(jpeg((100, 100))), b64(gif.getvalue()),
+                "A" * (worker.MAX_PHOTO_BYTES * 2), 123, ""):
+        with pytest.raises(worker.Problem) as error:
+            worker.parse_request({"garment_ids": [G1], "person_photo": bad})
+        assert error.value.status == 400 and error.value.code == "INVALID_ARGUMENT"
+
+
+def test_uploaded_photo_replaces_the_avatar_lookup(api, monkeypatch):
+    def avatar_must_not_be_used(token):
+        raise AssertionError("avatar fetched although a photo was sent")
+
+    monkeypatch.setattr(worker, "person_photo", avatar_must_not_be_used)
+    created = api.post("/api/v1/outfit-visualizations", json={"garment_ids": [G1], "person_photo": b64(jpeg())}, headers=AUTH)
+    assert created.status_code == 202
+    assert wait(api, created.json()["id"])["status"] == "READY"
+    bad = api.post("/api/v1/outfit-visualizations", json={"garment_ids": [G1], "person_photo": "nope"}, headers=AUTH)
+    assert bad.status_code == 400
+
+
+class Reply:
+    def __init__(self, status, body):
+        self.status_code, self._body, self.text = status, body, str(body)
+
+    def json(self):
+        return self._body
+
+
+FLAGGED_REPLY = Reply(400, {"errors": [{"code": 3030, "message": "Your output has been flagged"}], "success": False})
+OK_REPLY = Reply(200, {"result": {"image": base64.b64encode(b"IMG").decode()}})
+
+
+@pytest.fixture
+def provider(monkeypatch):
+    monkeypatch.setenv("CF_API_TOKEN", "t")
+    monkeypatch.setenv("CF_ACCOUNT_ID", "a")
+    calls = []
+
+    def script(*replies):
+        queue = list(replies)
+
+        def post(url, **kwargs):
+            calls.append(kwargs["data"]["prompt"])
+            return queue.pop(0)
+
+        monkeypatch.setattr(worker.httpx, "post", post)
+        return calls
+
+    return script
+
+
+def test_a_flagged_result_is_retried_once_with_abstract_prints(provider):
+    calls = provider(FLAGGED_REPLY, OK_REPLY)
+    assert worker.generate(jpeg(), [garment(G1)]) == b"IMG"
+    assert len(calls) == 2
+    assert worker.PLAIN_PRINTS not in calls[0] and worker.PLAIN_PRINTS in calls[1]
+
+
+def test_a_garment_flagged_twice_is_reported_as_content_flagged(provider):
+    calls = provider(FLAGGED_REPLY, FLAGGED_REPLY)
+    with pytest.raises(RuntimeError, match="CONTENT_FLAGGED"):
+        worker.generate(jpeg(), [garment(G1)])
+    assert len(calls) == 2
+
+
+def test_other_provider_errors_are_not_retried(provider):
+    calls = provider(Reply(500, {"errors": [{"code": 1, "message": "boom"}]}), OK_REPLY)
+    with pytest.raises(RuntimeError, match="PROVIDER_FAILED"):
+        worker.generate(jpeg(), [garment(G1)])
+    assert len(calls) == 1
+
+
+def test_a_reply_that_is_not_json_is_never_a_flag():
+    class NotJson:
+        def json(self):
+            raise ValueError("not json")
+
+    assert worker.is_flagged(NotJson()) is False
+
+
+def test_the_job_keeps_the_flagged_code_for_the_client(api, monkeypatch):
+    def flagged(person, garments):
+        raise RuntimeError("CONTENT_FLAGGED")
+
+    monkeypatch.setattr(worker, "jobs", worker.Jobs(runner=flagged))
+    job = api.post("/api/v1/outfit-visualizations", json={"garment_ids": [G1]}, headers=AUTH).json()
+    done = wait(api, job["id"])
+    assert done["status"] == "FAILED" and done["error"] == "CONTENT_FLAGGED"
 
 
 def test_inputs_are_shrunk_below_the_provider_limit():

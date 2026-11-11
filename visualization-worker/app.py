@@ -9,6 +9,7 @@ Jobs live in memory.
 """
 import base64
 import io
+import logging
 import os
 import re
 import time
@@ -22,10 +23,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
+log = logging.getLogger("uvicorn.error")  # shows up in the worker's console
+MAX_PHOTO_BYTES = 8 * 1024 * 1024  # same limit as the avatar photo
 MAX_GARMENTS = 3  # Cloudflare takes 4 reference images: the person plus three garments
 MAX_SIDE = 480  # Cloudflare requires every input image to be smaller than 512x512
 MAX_JOBS = 50  # shortcut: in-memory jobs, oldest dropped; persist them if results must survive restarts
 MODEL = "@cf/black-forest-labs/flux-2-klein-4b"
+FLAGGED = 3030  # Cloudflare error code: "Your output has been flagged"
 OUTPUT_SIZE = ("512", "768")
 
 MESSAGES = {
@@ -78,7 +82,24 @@ def uuid_text(value):
         raise Problem(400, "INVALID_ARGUMENT", "Se esperaba un UUID.")
 
 
+def decode_photo(value):
+    """A photo sent by the client is a trust boundary: size, real image content and format."""
+    problem = Problem(400, "INVALID_ARGUMENT", "person_photo debe ser una imagen JPEG, PNG o WebP en base64 (máx. 8 MiB, mínimo 256 px).")
+    if not isinstance(value, str) or len(value) > MAX_PHOTO_BYTES * 4 // 3 + 64:
+        raise problem
+    try:
+        data = base64.b64decode(value.split(",")[-1], validate=True)
+        image = Image.open(io.BytesIO(data))
+        image.verify()
+    except Exception:
+        raise problem
+    if image.format not in ("JPEG", "PNG", "WEBP") or min(image.size) < 256 or image.size[0] * image.size[1] > 20_000_000:
+        raise problem
+    return data
+
+
 def parse_request(body):
+    """Returns (garment ids, recommendation id or None, person photo bytes or None)."""
     ids = body.get("garment_ids") if isinstance(body, dict) else None
     if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_GARMENTS:
         raise Problem(400, "INVALID_ARGUMENT", f"garment_ids debe tener entre 1 y {MAX_GARMENTS} UUID.")
@@ -86,7 +107,9 @@ def parse_request(body):
     if len(set(ids)) != len(ids):
         raise Problem(400, "INVALID_ARGUMENT", "garment_ids no admite repetidos.")
     recommendation = body.get("recommendation_id")
-    return ids, (uuid_text(recommendation) if recommendation is not None else None)
+    photo = body.get("person_photo")
+    return (ids, uuid_text(recommendation) if recommendation is not None else None,
+            decode_photo(photo) if photo is not None else None)
 
 
 # ---- who is calling ---------------------------------------------------------------------
@@ -176,7 +199,13 @@ def garments_with_images(token, ids):
 # ---- generation -------------------------------------------------------------------------
 
 
-def build_prompt(garments):
+PLAIN_PRINTS = (
+    " Render any printed graphic, photo, text or logo on the garments as a simple abstract pattern: "
+    "never draw faces or readable text."
+)
+
+
+def build_prompt(garments, plain_prints=False):
     # Only closed-vocabulary fields (category, colours): free-text descriptions are data and
     # must never reach the model as instructions.
     lines = []
@@ -189,6 +218,7 @@ def build_prompt(garments):
         "Keep the exact face, identity, hairstyle, skin tone, body proportions and pose of image 1, and the same plain background. "
         "Change only the clothing items shown in the other images and keep every other item from image 1 as it is. "
         "Reproduce each garment's colors, design and texture faithfully, with realistic fabric folds and lighting, full body in frame."
+        + (PLAIN_PRINTS if plain_prints else "")
     )
 
 
@@ -213,17 +243,33 @@ def generate(person, garments):
     if not cfg["cf_token"] or not cfg["cf_account"]:
         raise RuntimeError("PROVIDER_NOT_CONFIGURED")
     images = [person] + [g["_image"] for g in garments]
-    files = {f"input_image_{i}": (f"{i}.png", small_png(data), "image/png") for i, data in enumerate(images)}
-    response = httpx.post(
-        f"https://api.cloudflare.com/client/v4/accounts/{cfg['cf_account']}/ai/run/{MODEL}",
-        headers={"Authorization": f"Bearer {cfg['cf_token']}"},
-        data={"prompt": build_prompt(garments), "width": OUTPUT_SIZE[0], "height": OUTPUT_SIZE[1]},
-        files=files,
-        timeout=300.0,
-    )
-    if response.status_code != 200:
-        raise RuntimeError("PROVIDER_FAILED")
-    return base64.b64decode(longest_string(response.json()).split(",")[-1])
+    # Encode once; the multipart body is rebuilt for a retry.
+    encoded = [small_png(data) for data in images]
+    for plain in (False, True):
+        files = {f"input_image_{i}": (f"{i}.png", png, "image/png") for i, png in enumerate(encoded)}
+        response = httpx.post(
+            f"https://api.cloudflare.com/client/v4/accounts/{cfg['cf_account']}/ai/run/{MODEL}",
+            headers={"Authorization": f"Bearer {cfg['cf_token']}"},
+            data={"prompt": build_prompt(garments, plain_prints=plain), "width": OUTPUT_SIZE[0], "height": OUTPUT_SIZE[1]},
+            files=files,
+            timeout=300.0,
+        )
+        if response.status_code == 200:
+            return base64.b64decode(longest_string(response.json()).split(",")[-1])
+        # The reason stays in the server log; clients only see a short code.
+        log.warning("cloudflare answered %s: %s", response.status_code, response.text[:300])
+        if not is_flagged(response):
+            raise RuntimeError("PROVIDER_FAILED")
+        # Flagged by the provider's safety filter (often a printed face on a band tee): retry
+        # once asking for abstract prints; if that is flagged too, tell the user.
+    raise RuntimeError("CONTENT_FLAGGED")
+
+
+def is_flagged(response):
+    try:
+        return any(error.get("code") == FLAGGED for error in response.json().get("errors", []))
+    except (ValueError, AttributeError):
+        return False
 
 
 class Jobs:
@@ -254,8 +300,10 @@ class Jobs:
             job["image"] = self.runner(person, garments)
             job["status"] = "READY"
         except Exception as error:  # the provider's message is never shown to clients
+            log.exception("visualization job %s failed", job_id)
             job["status"] = "FAILED"
-            job["error"] = str(error) if str(error) in ("PROVIDER_NOT_CONFIGURED", "PROVIDER_FAILED") else "INTERNAL_ERROR"
+            known = ("PROVIDER_NOT_CONFIGURED", "PROVIDER_FAILED", "CONTENT_FLAGGED")
+            job["error"] = str(error) if str(error) in known else "INTERNAL_ERROR"
 
     def owned(self, job_id, owner):
         job = self.jobs.get(job_id)
@@ -292,10 +340,11 @@ def health():
 @app.post("/api/v1/outfit-visualizations", status_code=202)
 def create(request: Request, body: dict = Body(...)):
     token = bearer(request.headers.get("authorization"))
-    ids, recommendation = parse_request(body)
+    ids, recommendation, uploaded = parse_request(body)
     owner = iam_user(token)
     garments = garments_with_images(token, ids)  # ownership and availability checked by the closet
-    person = person_photo(token)
+    # A photo sent with the request wins; otherwise the saved avatar photo from IAM. Neither is stored here.
+    person = uploaded if uploaded is not None else person_photo(token)
     return JSONResponse(public(jobs.submit(owner, ids, recommendation, person, garments)), status_code=202,
                         headers={"Cache-Control": "no-store"})
 
